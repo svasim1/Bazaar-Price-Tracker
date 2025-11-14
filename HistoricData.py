@@ -1,5 +1,6 @@
 import requests
 import re
+
 #https://sky.coflnet.com/api/items/bazaar/tags
 def fetch_historic_data(item_id):
     url = f"https://sky.coflnet.com/api/bazaar/{item_id}/history"
