@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta
 
 def fetch_all_data(item="BOOSTER_COOKIE",
-                   start=datetime(2021, 9, 10, 0, 0, 0),
+                   start=datetime(2020, 9, 10, 0, 0, 0),
                    end=datetime.now(),
                    interval_seconds=82800):
 
