@@ -1,22 +1,22 @@
-import requests
 import re
+import json
 
-#https://sky.coflnet.com/api/items/bazaar/tags
+
 def fetch_historic_data(item_id):
-    url = f"https://sky.coflnet.com/api/bazaar/{item_id}/history"
-    response = requests.get(url)
-    html_content = response.text
-    buy_data= re.findall(r'"buy":([^,]*),', html_content)
-    sell_data = re.findall(r'"sell":([^,]*),', html_content)
-    time_data =re.findall(r'"timestamp":"([^"]*)"', html_content)
-    buyVolume_data = re.findall(r'"buyVolume":([^,]*),', html_content)
-    sellVolume_data = re.findall(r'"sellVolume":([^,]*),', html_content)
-    buyMovingWeek_data = re.findall(r'"buyMovingWeek":([^,]*),', html_content)
-    sellMovingWeek_data = re.findall(r'"sellMovingWeek":([^},]*)},', html_content)
-    maxBuy_data = re.findall(r'"maxBuy":([^,]*),', html_content)
-    maxSell_data = re.findall(r'"maxSell":([^,]*),', html_content)
-    minBuy_data = re.findall(r'"minBuy":([^,]*),', html_content)
-    minSell_data = re.findall(r'"minSell":([^,]*),', html_content)
+    with open('bazaar_history_combined.json', 'r') as f:
+        data = json.load(f)
+    json_content = str(data)
+    buy_data= re.findall(r'"buy":([^,]*),', json_content)
+    sell_data = re.findall(r'"sell":([^,]*),', json_content)
+    time_data =re.findall(r'"timestamp":"([^"]*)"', json_content)
+    buyVolume_data = re.findall(r'"buyVolume":([^,]*),', json_content)
+    sellVolume_data = re.findall(r'"sellVolume":([^,]*),', json_content)
+    buyMovingWeek_data = re.findall(r'"buyMovingWeek":([^,]*),', json_content)
+    sellMovingWeek_data = re.findall(r'"sellMovingWeek":([^},]*)},', json_content)
+    maxBuy_data = re.findall(r'"maxBuy":([^,]*),', json_content)
+    maxSell_data = re.findall(r'"maxSell":([^,]*),', json_content)
+    minBuy_data = re.findall(r'"minBuy":([^,]*),', json_content)
+    minSell_data = re.findall(r'"minSell":([^,]*),', json_content)
     years_data = []
     months_data = []
     days_data = []
@@ -42,6 +42,7 @@ def fetch_historic_data(item_id):
     minBuy_data_float = [float(minb) for minb in minBuy_data]
     minSell_data_float = [float(mins) for mins in minSell_data]
 
+    return years_int, months_int, days_int, buy_data_float, sell_data_float, buyVolume_data_float, sellVolume_data_float, buyMovingWeek_data_int, sellMovingWeek_data_int, maxBuy_data_float, maxSell_data_float, minBuy_data_float, minSell_data_float
 
 
 

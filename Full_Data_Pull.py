@@ -53,7 +53,7 @@ def fetch_all_data(item,
 temp = requests.get("https://sky.coflnet.com/api/items/bazaar/tags")
 itemIDs = re.findall(r'"([^"]*)"', temp.text)
 
-
+print(len(itemIDs))
 for itemID in itemIDs:
     all_data = fetch_all_data(itemID)
 
