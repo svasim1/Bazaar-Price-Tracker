@@ -2,13 +2,15 @@ import json
 import os
 import numpy as np
 from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import joblib
 from data_utils import load_or_fetch_item_data
 from mayor_utils import get_mayor_perks, match_mayor_perks
+from visualization_server import visualize_predictions
+from outlier_utils import remove_outliers, detect_outliers_for_viz
+from backtest import run_backtest, print_backtest_report
 
 
 def prepare_features(timestamp, buy_price, sell_price, buy_volume, sell_volume,
@@ -99,23 +101,35 @@ def train_and_test_single_item(item_id, cleanup=False):
     y = np.array(targets)
     timestamps = np.array(timestamps)
     
-    print(f"Total data points: {len(X)}")
+    print(f"Total data points (before outlier removal): {len(X)}")
+    
+    # Remove outliers using Tukey's method
+    X, y, timestamps, outlier_info = remove_outliers(X, y, timestamps, method='tukey', multiplier=1.5)
+    
+    print(f"Outliers removed: {outlier_info['outliers_removed']} ({outlier_info['outlier_percentage']:.2f}%)")
+    print(f"Training data points (after outlier removal): {len(X)}")
+    print(f"Outlier bounds: [{outlier_info['lower_bound']:.2f}, {outlier_info['upper_bound']:.2f}]")
     
     # Find start date from data
     dates = [datetime.strptime(ts[:10], '%Y-%m-%d') for ts in timestamps]
     start_date = min(dates)
     
-    # Split into train/test based on time
+    # Split into train/test based on time (85/15 split)
+    # Sort by date to ensure chronological split
+    date_indices = np.argsort([datetime.strptime(ts[:10], '%Y-%m-%d') for ts in timestamps])
+    X = X[date_indices]
+    y = y[date_indices]
+    timestamps = timestamps[date_indices]
+    
+    # Calculate 85/15 split point
+    split_idx = int(len(X) * 0.85)
+    split_date = datetime.strptime(timestamps[split_idx][:10], '%Y-%m-%d')
     today = datetime.now()
-    test_days = 30  # Last 30 days for testing
-    split_date = today - timedelta(days=test_days)
     
-    train_mask = np.array([datetime.strptime(ts[:10], '%Y-%m-%d') < split_date for ts in timestamps])
-    test_mask = ~train_mask
-    
-    X_train, X_test = X[train_mask], X[test_mask]
-    y_train, y_test = y[train_mask], y[test_mask]
-    timestamps_train, timestamps_test = timestamps[train_mask], timestamps[test_mask]
+    # Create train/test sets
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    timestamps_train, timestamps_test = timestamps[:split_idx], timestamps[split_idx:]
     
     print(f"Training samples: {len(X_train)}")
     print(f"Test samples: {len(X_test)}")
@@ -127,10 +141,11 @@ def train_and_test_single_item(item_id, cleanup=False):
     
     print("\nTraining Random Forest...")
     model = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=20,
-        min_samples_split=5,
-        min_samples_leaf=2,
+        n_estimators=50,  # Reduced from 100
+        max_depth=10,  # Reduced from 20 to prevent overfitting
+        min_samples_split=20,  # Increased from 5 to require more samples per split
+        min_samples_leaf=10,  # Increased from 2 to require more samples per leaf
+        max_features='sqrt',  # Use sqrt of features to add randomness
         random_state=42,
         n_jobs=-1
     )
@@ -190,80 +205,57 @@ def train_and_test_single_item(item_id, cleanup=False):
     future_features_scaled = scaler.transform(future_features)
     future_predictions = model.predict(future_features_scaled)
     
-    # Create comprehensive plot
-    plt.figure(figsize=(16, 10))
-    plt.style.use('dark_background')
-    
-    # Plot 1: Historical data with predictions
-    plt.subplot(2, 1, 1)
-    
-    # All historical dates
+    # Prepare data for visualization
     all_dates = [datetime.strptime(ts[:10], '%Y-%m-%d') for ts in timestamps]
+    test_dates_dt = [datetime.strptime(ts[:10], '%Y-%m-%d') for ts in timestamps_test]
     
-    plt.plot(all_dates, y, 'o-', color='#4A5568', alpha=0.6, markersize=2, 
-             label='Historical Actual', linewidth=1)
+    # Detect outliers for visualization (on all historical data)
+    all_timestamps_str = [d.strftime('%Y-%m-%d') for d in all_dates]
+    outliers_viz = detect_outliers_for_viz(y, all_timestamps_str, method='tukey', multiplier=1.5)
     
-    # Test predictions
-    test_dates = [datetime.strptime(ts[:10], '%Y-%m-%d') for ts in timestamps_test]
-    plt.plot(test_dates, y_test, 'o', color='#F7FAFC', markersize=4, 
-             label='Test Actual', zorder=5)
-    plt.plot(test_dates, y_pred, 's', color='#718096', markersize=4, 
-             label='Test Predicted', zorder=5)
+    current_price = y_test[-1] if len(y_test) > 0 else y_train[-1]
+    avg_future = np.mean(future_predictions)
+    trend_pct = ((avg_future - current_price) / current_price) * 100
     
-    # Future predictions
-    plt.plot(future_dates, future_predictions, 'D-', color='#2D3748', 
-             markersize=5, linewidth=2, label='Future Forecast', zorder=10)
+    metrics_dict = {
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'mape': mape
+    }
     
-    plt.axvline(x=split_date, color='#1A202C', linestyle='--', linewidth=2, 
-                label='Train/Test Split')
-    plt.axvline(x=today, color='#2D3748', linestyle='--', linewidth=2, 
-                label='Today')
+    forecast_summary_dict = {
+        'current_price': current_price,
+        'avg_forecast': avg_future,
+        'trend': trend_pct,
+        'min_pred': np.min(future_predictions),
+        'max_pred': np.max(future_predictions)
+    }
     
-    plt.xlabel('Date', fontsize=12, color='#E2E8F0')
-    plt.ylabel('Buy Price (coins)', fontsize=12, color='#E2E8F0')
-    plt.title(f'{item_id} - Price Prediction Model (Start: {start_date.strftime("%Y-%m-%d")} to Today + 30 days)',
-              fontsize=14, fontweight='bold', color='#F7FAFC')
-    plt.legend(loc='best', facecolor='#1A202C', edgecolor='#2D3748')
-    plt.grid(True, alpha=0.2, color='#4A5568')
-    plt.xticks(rotation=45, color='#CBD5E0')
-    plt.yticks(color='#CBD5E0')
+    # Launch interactive visualization
+    visualize_predictions(
+        item_id=item_id,
+        historical_dates=all_dates,
+        historical_prices=y,
+        test_dates=test_dates_dt,
+        test_actual=y_test,
+        test_predicted=y_pred,
+        future_dates=future_dates,
+        future_predictions=future_predictions,
+        split_date=split_date,
+        today=today,
+        start_date=start_date,
+        metrics=metrics_dict,
+        forecast_summary=forecast_summary_dict,
+        outliers=outliers_viz
+    )
     
-    # Plot 2: Forecast details
-    plt.subplot(2, 1, 2)
-    
-    forecast_days = list(range(1, 31))
-    plt.plot(forecast_days, future_predictions, 'D-', color='#2D3748', 
-             markersize=6, linewidth=2)
-    plt.fill_between(forecast_days, future_predictions * 0.95, future_predictions * 1.05,
-                      alpha=0.2, color='#4A5568')
-    
-    plt.xlabel('Days from Today', fontsize=12, color='#E2E8F0')
-    plt.ylabel('Predicted Price (coins)', fontsize=12, color='#E2E8F0')
-    plt.title('30-Day Price Forecast with 5% Confidence Band', 
-              fontsize=14, fontweight='bold', color='#F7FAFC')
-    plt.grid(True, alpha=0.2, color='#4A5568')
-    plt.xticks(color='#CBD5E0')
-    plt.yticks(color='#CBD5E0')
-    
-    # Add accuracy text box
-    textstr = f'Model Accuracy:\nMAE: {mae:.2f}\nRMSE: {rmse:.2f}\nR²: {r2:.4f}\nMAPE: {mape:.2f}%'
-    props = dict(boxstyle='round', facecolor='#1A202C', edgecolor='#2D3748', alpha=0.8)
-    plt.text(0.02, 0.98, textstr, transform=plt.gca().transAxes, fontsize=10,
-             verticalalignment='top', bbox=props, color='#E2E8F0')
-    
-    plt.tight_layout()
-    plt.savefig(f'{item_id}_forecast.png', dpi=150, facecolor='#0F1419')
-    print(f"Graph saved as {item_id}_forecast.png")
-    plt.show()
-    
-    # Print forecast roadmap
+    # Print forecast roadmap to console
     print(f"\n{'='*60}")
     print(f"30-DAY PRICE FORECAST ROADMAP FOR {item_id}")
     print(f"{'='*60}")
     print(f"{'Date':<15} {'Predicted Price':<20} {'Change from Today':<20}")
     print(f"{'-'*60}")
-    
-    current_price = y_test[-1] if len(y_test) > 0 else y_train[-1]
     
     for i, (date, price) in enumerate(zip(future_dates, future_predictions)):
         change = ((price - current_price) / current_price) * 100
@@ -275,7 +267,6 @@ def train_and_test_single_item(item_id, cleanup=False):
     
     print(f"{'='*60}")
     
-    avg_future = np.mean(future_predictions)
     trend = "UPWARD" if avg_future > current_price else "DOWNWARD"
     magnitude = abs(((avg_future - current_price) / current_price) * 100)
     
@@ -285,6 +276,11 @@ def train_and_test_single_item(item_id, cleanup=False):
     print(f"  Expected Trend: {trend} ({magnitude:.2f}%)")
     print(f"  Minimum Expected: {np.min(future_predictions):,.2f} coins")
     print(f"  Maximum Expected: {np.max(future_predictions):,.2f} coins")
+    
+    # Run backtest simulation
+    print(f"\nRunning backtest simulation...")
+    backtest_results = run_backtest(X_test, y_test, model, scaler, timestamps_test)
+    print_backtest_report(backtest_results)
     
     # Save model
     joblib.dump(model, f'{item_id}_model.pkl')
