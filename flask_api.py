@@ -11,11 +11,14 @@ from flask_cors import CORS
 import joblib
 import os
 import requests
+import json
+import threading
+import time
 from datetime import datetime
 
-from LGBMfulldata import predict_item, train_two_phase_model, train_global_model
-from incremental_learning import IncrementalLearner
-from data_utils import load_or_fetch_item_data, fetch_recent_data
+from LGBMfulldata import (predict_item_three_models, train_three_model_system,
+                           analyze_best_flips, analyze_best_investments, analyze_crash_watch)
+from data_utils import fetch_recent_data
 from mayor_utils import get_mayor_perks
 
 
@@ -25,20 +28,26 @@ CORS(app)
 # Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Global variables for model artifacts
-model = None
+# Global variables for THREE model artifacts
+models_dict = None  # Will contain 'buy', 'sell', 'spread' models
 scaler = None
 feature_columns = None
 item_encoder = None
-incremental_learner = None
 mayor_data_cache = None
 model_trained = False
 
+# Cached predictions
+cached_predictions = {}
+predictions_file = os.path.join(SCRIPT_DIR, 'predictions_cache.json')
+prediction_lock = threading.Lock()
+
 
 def check_model_exists():
-    """Check if all required model files exist."""
+    """Check if all required three-model files exist."""
     model_files = [
-        'global_lgbm_model.pkl',
+        'buy_lgbm_model.pkl',
+        'sell_lgbm_model.pkl',
+        'spread_lgbm_model.pkl',
         'global_scaler.pkl',
         'global_feature_columns.pkl',
         'item_encoder.pkl'
@@ -47,33 +56,191 @@ def check_model_exists():
 
 
 def load_model_artifacts():
-    """Load existing model artifacts."""
-    global model, scaler, feature_columns, item_encoder, incremental_learner, mayor_data_cache, model_trained
+    """Load existing THREE model artifacts."""
+    global models_dict, scaler, feature_columns, item_encoder, mayor_data_cache, model_trained
     
-    print("Loading model artifacts...")
+    print("Loading three-model system artifacts...")
     try:
-        model = joblib.load(os.path.join(SCRIPT_DIR, 'global_lgbm_model.pkl'))
+        # Load all 3 models
+        models_dict = {
+            'buy': joblib.load(os.path.join(SCRIPT_DIR, 'buy_lgbm_model.pkl')),
+            'sell': joblib.load(os.path.join(SCRIPT_DIR, 'sell_lgbm_model.pkl')),
+            'spread': joblib.load(os.path.join(SCRIPT_DIR, 'spread_lgbm_model.pkl'))
+        }
+        
         scaler = joblib.load(os.path.join(SCRIPT_DIR, 'global_scaler.pkl'))
         feature_columns = joblib.load(os.path.join(SCRIPT_DIR, 'global_feature_columns.pkl'))
         item_encoder = joblib.load(os.path.join(SCRIPT_DIR, 'item_encoder.pkl'))
-        
-        # Initialize incremental learner
-        incremental_learner = IncrementalLearner()
         
         # Cache mayor data
         mayor_data_cache = get_mayor_perks()
         
         model_trained = True
-        print("✅ Model artifacts loaded successfully!")
+        print("✅ Three-model system loaded successfully!")
+        print("   - BUY model loaded")
+        print("   - SELL model loaded")
+        print("   - SPREAD model loaded")
         return True
     except Exception as e:
         print(f"❌ Error loading model artifacts: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
+def get_available_items():
+    """Get list of items that have downloaded JSON data files."""
+    json_dir = "/Users/samuelbraga/Json Files"
+    available_items = []
+    
+    try:
+        if os.path.exists(json_dir):
+            for filename in os.listdir(json_dir):
+                if filename.startswith("bazaar_history_combined_") and filename.endswith(".json"):
+                    # Extract item ID from filename
+                    item_id = filename.replace("bazaar_history_combined_", "").replace(".json", "")
+                    available_items.append(item_id)
+            print(f"📁 Found {len(available_items)} items with downloaded data")
+        else:
+            print(f"⚠️  JSON directory not found: {json_dir}")
+    except Exception as e:
+        print(f"⚠️  Error scanning JSON files: {e}")
+    
+    return available_items
+
+
+def load_cached_predictions():
+    """Load predictions from cache file."""
+    global cached_predictions
+    try:
+        if os.path.exists(predictions_file):
+            with open(predictions_file, 'r') as f:
+                cached_predictions = json.load(f)
+            print(f"✅ Loaded {len(cached_predictions)} cached predictions")
+        else:
+            cached_predictions = {}
+    except Exception as e:
+        print(f"⚠️  Error loading cached predictions: {e}")
+        cached_predictions = {}
+
+
+def save_cached_predictions():
+    """Save predictions to cache file."""
+    try:
+        with prediction_lock:
+            with open(predictions_file, 'w') as f:
+                json.dump(cached_predictions, f, indent=2)
+    except Exception as e:
+        print(f"⚠️  Error saving cached predictions: {e}")
+
+
+def background_prediction_loop():
+    """Background thread that continuously updates predictions for all items."""
+    global cached_predictions
+    
+    print("\n🔄 Starting background prediction loop...")
+    
+    while True:
+        try:
+            if not model_trained:
+                print("⏳ Waiting for model to be trained...")
+                time.sleep(10)
+                continue
+            
+            # Get only items that have downloaded JSON data
+            available_items = get_available_items()
+            if not available_items:
+                print("⚠️  No items with downloaded data found, sleeping...")
+                time.sleep(60)
+                continue
+            
+            print(f"\n📊 Updating predictions for {len(available_items)} items with downloaded data...")
+            
+            batch_count = 0
+            updated_count = 0
+            
+            for item_id in available_items:
+                try:
+                    # Make prediction with THREE models
+                    prediction = predict_item_three_models(
+                        models_dict, scaler, feature_columns, item_encoder,
+                        item_id, mayor_data_cache
+                    )
+                    
+                    # Store comprehensive prediction in cache
+                    with prediction_lock:
+                        cached_predictions[item_id] = {
+                            'item_id': prediction['item_id'],
+                            'timestamp': prediction['timestamp'],
+                            
+                            # Buy price info
+                            'buy_current': prediction['buy']['current_price'],
+                            'buy_predicted': prediction['buy']['predicted_price'],
+                            'buy_change_pct': prediction['buy']['change_pct'],
+                            'buy_direction': prediction['buy']['direction'],
+                            'buy_confidence': prediction['buy']['confidence'],
+                            
+                            # Sell price info
+                            'sell_current': prediction['sell']['current_price'],
+                            'sell_predicted': prediction['sell']['predicted_price'],
+                            'sell_change_pct': prediction['sell']['change_pct'],
+                            'sell_direction': prediction['sell']['direction'],
+                            'sell_confidence': prediction['sell']['confidence'],
+                            
+                            # Spread info
+                            'spread_current': prediction['spread']['current_spread'],
+                            'spread_predicted': prediction['spread']['predicted_spread'],
+                            'spread_direction': prediction['spread']['direction'],
+                            'spread_confidence': prediction['spread']['confidence'],
+                            
+                            # Flip profit
+                            'flip_profit_current': prediction['flip_profit']['current_pct'],
+                            'flip_profit_predicted': prediction['flip_profit']['predicted_pct'],
+                            
+                            # Overall recommendation
+                            'recommendation': prediction['recommendation'],
+                            
+                            # Legacy fields for backward compatibility
+                            'action': 'BUY' if prediction['buy']['direction'] == 'UP' else 'SELL',
+                            'current_price': prediction['buy']['current_price'],
+                            'predicted_price': prediction['buy']['predicted_price'],
+                            'expected_profit_pct': abs(prediction['buy']['change_pct']),
+                            'confidence': prediction['buy']['confidence'],
+                            'direction': prediction['buy']['direction']
+                        }
+                    
+                    updated_count += 1
+                    batch_count += 1
+                    
+                    # Save to file every 30 items
+                    if batch_count >= 30:
+                        save_cached_predictions()
+                        print(f"  ✓ Updated {updated_count}/{len(available_items)} items (sleeping 10s)")
+                        time.sleep(10)  # Sleep after every 30 items
+                        batch_count = 0
+                        
+                except Exception as e:
+                    print(f"  ✗ Error predicting {item_id}: {e}")
+                    continue
+            
+            # Save any remaining predictions
+            if batch_count > 0:
+                save_cached_predictions()
+            
+            print(f"✅ Completed prediction cycle: {updated_count}/{len(available_items)} items updated")
+            print("⏳ Sleeping 10 seconds before next cycle...")
+            time.sleep(10)
+            
+        except Exception as e:
+            print(f"❌ Error in prediction loop: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(30)  # Wait longer on error
+
+
 def train_full_model():
-    """Train the full model using two-phase temporal CV."""
-    global model, scaler, feature_columns, item_encoder, incremental_learner, mayor_data_cache, model_trained
+    """Train the full model using three-model system."""
+    global models_dict, scaler, feature_columns, item_encoder, mayor_data_cache, model_trained
     
     print("\n" + "="*70)
     print("MODEL NOT FOUND - TRAINING FULL MODEL")
@@ -87,15 +254,14 @@ def train_full_model():
         item_ids = requests.get(url).json()
         print(f"Training on {len(item_ids)} items with two-phase temporal CV")
         
-        # Train using two-phase approach (pre/post mayor data splits)
-        model, scaler, feature_columns, item_encoder = train_two_phase_model(item_ids)
+        # Train using three-model system
+        # update_with_new_data=True on retrain to fetch only new data since last update
+        print("\nNote: Set update_with_new_data=True in data_utils calls for retraining")
+        models_dict, scaler, feature_columns, item_encoder = train_three_model_system(item_ids)
         
-        if model is None:
+        if models_dict is None:
             print("❌ Training failed - no valid data found.")
             return False
-        
-        # Initialize incremental learner
-        incremental_learner = IncrementalLearner()
         
         # Cache mayor data
         mayor_data_cache = get_mayor_perks()
@@ -142,10 +308,9 @@ def root():
             'health': '/health',
             'items': '/items',
             'predict': '/predict/<item_id>',
+            'predict_with_data': '/predict/with-data',
             'predict_batch': '/predict/batch',
-            'recommendations': '/recommendations',
-            'update_incremental': '/update/incremental',
-            'update_history': '/update/history'
+            'recommendations': '/recommendations'
         }
     })
 
@@ -156,9 +321,8 @@ def health_check():
     """Check server health and model status."""
     return jsonify({
         'status': 'healthy',
-        'model_loaded': model is not None,
+        'model_loaded': models_dict is not None,
         'model_trained': model_trained,
-        'incremental_learner_available': incremental_learner is not None,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -167,29 +331,16 @@ def health_check():
 @app.route('/predict/<item_id>')
 def predict_single(item_id):
     """
-    Predict price direction for a specific item using recent API data.
-    Query params:
-        - hours: int (optional, default 24) - hours of recent data to fetch
+    Predict price direction for a specific item using three-model system.
     """
-    if model is None:
+    if models_dict is None:
         return jsonify({'error': 'Model not loaded'}), 503
     
     try:
-        hours = int(request.args.get('hours', 24))
-        
-        # Fetch only recent data from API
-        print(f"Fetching last {hours} hours of data for {item_id}...")
-        data = fetch_recent_data(item_id, hours=hours)
-        
-        if data is None or len(data) == 0:
-            return jsonify({
-                'error': f'No recent data available for item {item_id}'
-            }), 404
-        
-        # Make prediction using recent data only
-        prediction = predict_item(
-            model, scaler, feature_columns, item_encoder,
-            item_id, data, mayor_data_cache
+        # Make prediction using three-model system
+        prediction = predict_item_three_models(
+            models_dict, scaler, feature_columns, item_encoder,
+            item_id, mayor_data_cache
         )
         
         return jsonify(prediction)
@@ -218,6 +369,12 @@ def get_items():
 
 
 
+# Legacy endpoint - disabled as not implemented for three-model system
+# @app.route('/predict/with-data', methods=['POST'])
+# def predict_with_data():
+#     """Disabled - not implemented for three-model system"""
+#     return jsonify({'error': 'Endpoint not available in three-model system'}), 501
+        
 # Batch prediction
 @app.route('/predict/batch', methods=['POST'])
 def predict_batch():
@@ -225,7 +382,7 @@ def predict_batch():
     Predict prices for multiple items using recent API data.
     Body: {"item_ids": ["ITEM1", "ITEM2", ...], "hours": 24 (optional)}
     """
-    if model is None:
+    if models_dict is None:
         return jsonify({'error': 'Model not loaded'}), 503
     
     try:
@@ -241,19 +398,10 @@ def predict_batch():
         
         for item_id in item_ids:
             try:
-                # Fetch recent data from API
-                item_data = fetch_recent_data(item_id, hours=hours)
-                
-                if item_data is None or len(item_data) == 0:
-                    errors.append({
-                        'item_id': item_id,
-                        'error': 'No recent data available'
-                    })
-                    continue
-                
-                prediction = predict_item(
-                    model, scaler, feature_columns, item_encoder,
-                    item_id, item_data, mayor_data_cache
+                # Make prediction using three-model system
+                prediction = predict_item_three_models(
+                    models_dict, scaler, feature_columns, item_encoder,
+                    item_id, mayor_data_cache
                 )
                 predictions.append(prediction)
                 
@@ -275,6 +423,47 @@ def predict_batch():
         return jsonify({'error': str(e)}), 500
 
 
+# Get cached predictions (fast endpoint)
+@app.route('/predictions')
+def get_cached_predictions():
+    """
+    Get cached predictions from the background loop.
+    Much faster than /recommendations as it doesn't compute predictions.
+    Query params:
+        - item_ids: comma-separated list of item IDs (optional)
+        - limit: int (default 10)
+        - min_confidence: float (default 50.0)
+    """
+    try:
+        item_ids_param = request.args.get('item_ids', None)
+        limit = int(request.args.get('limit', 10))
+        min_confidence = float(request.args.get('min_confidence', 50.0))
+        
+        with prediction_lock:
+            predictions_list = list(cached_predictions.values())
+        
+        # Filter by item_ids if provided
+        if item_ids_param:
+            requested_ids = [id.strip() for id in item_ids_param.split(',')]
+            predictions_list = [p for p in predictions_list if p['item_id'] in requested_ids]
+        
+        # Filter by confidence
+        predictions_list = [p for p in predictions_list if p['confidence'] >= min_confidence]
+        
+        # Sort by confidence descending
+        predictions_list.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        return jsonify({
+            'predictions': predictions_list[:limit],
+            'total': len(predictions_list),
+            'cache_size': len(cached_predictions),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # Get recommendations for Minecraft mod
 @app.route('/recommendations')
 def get_recommendations():
@@ -286,13 +475,12 @@ def get_recommendations():
         - min_confidence: float (default 60.0)
         - hours: int (default 24) - hours of recent data to analyze
     """
-    if model is None:
+    if models_dict is None:
         return jsonify({'error': 'Model not loaded'}), 503
     
     try:
         limit = int(request.args.get('limit', 10))
         min_confidence = float(request.args.get('min_confidence', 50.0))
-        hours = int(request.args.get('hours', 168))
         
         # Get all items from encoder
         all_items = list(item_encoder.classes_)  # Use all items the model was trained on
@@ -301,14 +489,10 @@ def get_recommendations():
         
         for item_id in all_items:
             try:
-                # Fetch recent data from API
-                item_data = fetch_recent_data(item_id, hours=hours)
-                if item_data is None or len(item_data) == 0:
-                    continue
-                
-                prediction = predict_item(
-                    model, scaler, feature_columns, item_encoder,
-                    item_id, item_data, mayor_data_cache
+                # Make prediction using three-model system
+                prediction = predict_item_three_models(
+                    models_dict, scaler, feature_columns, item_encoder,
+                    item_id, mayor_data_cache
                 )
                 
                 # Only include confident predictions
@@ -339,46 +523,27 @@ def get_recommendations():
         return jsonify({'error': str(e)}), 500
 
 
-# Incremental learning with 90/10 split
-@app.route('/update/incremental', methods=['POST'])
-def update_incremental():
+# Investment Analysis Endpoints
+
+@app.route('/flips')
+def get_best_flips():
     """
-    Incrementally update model with recent data (90/10 split with mayor data).
-    Body: {
-        "item_ids": ["ITEM1", "ITEM2", ...],
-        "num_boost_round": 50 (optional)
-    }
+    Get best flip opportunities (largest spread where sell_order > buy_order).
+    Query params:
+        - limit: int (default 10)
     """
-    if incremental_learner is None:
-        return jsonify({'error': 'Incremental learner not available'}), 503
-    
     try:
-        data = request.get_json()
-        item_ids = data.get('item_ids', [])
-        num_boost_round = data.get('num_boost_round', 50)
+        limit = int(request.args.get('limit', 10))
         
-        if not item_ids:
-            return jsonify({'error': 'No item_ids provided'}), 400
+        with prediction_lock:
+            predictions_list = list(cached_predictions.values())
         
-        # Perform incremental update
-        results = incremental_learner.update_multiple_items(
-            item_ids,
-            num_boost_round=num_boost_round
-        )
-        
-        # Reload model artifacts
-        global model, scaler, feature_columns, item_encoder
-        model = incremental_learner.model
-        scaler = incremental_learner.scaler
-        feature_columns = incremental_learner.feature_columns
-        item_encoder = incremental_learner.item_encoder
-        
-        success_count = sum(1 for r in results if r.get('status') == 'success')
+        # Analyze flips
+        flips = analyze_best_flips(predictions_list, top_n=limit)
         
         return jsonify({
-            'status': 'completed',
-            'message': f'Updated model with {success_count}/{len(item_ids)} items',
-            'results': results,
+            'flips': flips,
+            'total': len(flips),
             'timestamp': datetime.now().isoformat()
         })
         
@@ -386,14 +551,67 @@ def update_incremental():
         return jsonify({'error': str(e)}), 500
 
 
-# Get update history
-@app.route('/update/history')
-def get_update_history():
-    """Get the history of incremental model updates."""
-    if incremental_learner is None:
-        return jsonify({'error': 'Incremental learner not available'}), 503
-    
-    return jsonify(incremental_learner.get_update_history())
+@app.route('/investments')
+def get_best_investments():
+    """
+    Get best investment opportunities with weighted expected return.
+    Query params:
+        - timeframe: str (1d, 1w, 1m) - default 1d
+        - limit: int (default 10)
+    """
+    try:
+        timeframe_str = request.args.get('timeframe', '1d')
+        limit = int(request.args.get('limit', 10))
+        
+        # Parse timeframe
+        timeframe_days = {
+            '1d': 1,
+            '1w': 7,
+            '1m': 30
+        }.get(timeframe_str, 1)
+        
+        with prediction_lock:
+            predictions_list = list(cached_predictions.values())
+        
+        # Analyze investments
+        investments = analyze_best_investments(predictions_list, timeframe_days=timeframe_days, top_n=limit)
+        
+        return jsonify({
+            'investments': investments,
+            'timeframe': timeframe_str,
+            'total': len(investments),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/crash_watch')
+def get_crash_watch():
+    """
+    Get items with predicted BUY ORDER crashes and reversal estimates.
+    Query params:
+        - limit: int (default 10)
+    """
+    try:
+        limit = int(request.args.get('limit', 10))
+        
+        with prediction_lock:
+            predictions_list = list(cached_predictions.values())
+        
+        # Analyze crash watch
+        crash_items = analyze_crash_watch(predictions_list, top_n=limit)
+        
+        return jsonify({
+            'crash_items': crash_items,
+            'total': len(crash_items),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 
 if __name__ == '__main__':
@@ -417,11 +635,20 @@ if __name__ == '__main__':
             print("❌ Cannot start server without a trained model.")
             exit(1)
     
+    # Load cached predictions
+    load_cached_predictions()
+    
+    # Start background prediction loop
+    prediction_thread = threading.Thread(target=background_prediction_loop, daemon=True)
+    prediction_thread.start()
+    print("✅ Background prediction thread started")
+    
     print("\n" + "="*70)
     print("🚀 Starting Flask API Server")
     print("="*70)
     print("Server running at: http://0.0.0.0:5001")
     print("Minecraft mod should connect to this endpoint")
+    print("/predictions - Fast cached predictions endpoint")
     print("="*70 + "\n")
     
     app.run(host='0.0.0.0', port=5001, debug=False)
