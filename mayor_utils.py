@@ -2,7 +2,7 @@ import requests
 import re
 import os
 from datetime import datetime
-
+import json
 
 def get_mayor_perks():
     """Fetch mayor perks data and return as binary vectors with timestamps.
@@ -13,7 +13,7 @@ def get_mayor_perks():
             - perks: list of 40 binary values (0 or 1) representing active perks
     """
     current_datetime = datetime.now()
-    url = f"https://sky.coflnet.com/api/mayor?from=2025-02-17T20%3A03%3A10.937Z&to={current_datetime.strftime('%Y-%m-%dT%H%%3A%M%%3A%S.%fZ')}"
+    url = f"https://sky.coflnet.com/api/mayor?from=2022-05-17T20%3A03%3A10.937Z&to={current_datetime.strftime('%Y-%m-%dT%H%%3A%M%%3A%S.%fZ')}"
     
     response = requests.get(url)
     html_content = response.text
@@ -21,7 +21,32 @@ def get_mayor_perks():
     mayors.pop(0)
     
     mayor_data = []
+    mayor_file = os.path.join(os.path.dirname(__file__), "88-207mayors.json")
+    with open(mayor_file, 'r') as file:
+        data = json.load(file)
+    perk_file = os.path.join(os.path.dirname(__file__), "perk_names.txt")
+    with open(perk_file, 'r') as file:
+        perk_names = file.read().splitlines()
+
+    for entry in data:
+        temp_start_date = entry["start_date"]
+        start_date = datetime.strptime(temp_start_date, '%Y-%m-%d')
+        mayor_perks = entry["mayor_perks"]
+        for perk in mayor_perks:
+            if perk in perk_names:
+                binary_perks = [0 for _ in range(40)]
+                perk_index = perk_names.index(perk)
+                binary_perks[perk_index] = 1
+        mayor_data.append({
+            'start_date': start_date,
+            'perks': binary_perks
+        })
+    
+
     for mayor in mayors:
+        temp = mayor.find('"year":')
+        mayor = mayor[:temp]
+
         # Date format is MM/DD/YYYY in the API response
         start_match = re.search(r'(\d{2}/\d{2}/\d{4})', mayor)
         if not start_match:
@@ -47,19 +72,8 @@ def get_mayor_perks():
     
     return mayor_data
 
+get_mayor_perks()
 
-def get_mayor_start_date(mayor_data):
-    """Get the earliest date when mayor data becomes available.
-    
-    Args:
-        mayor_data: List of mayor data from get_mayor_perks()
-        
-    Returns:
-        datetime object of the earliest mayor start date, or None if no data
-    """
-    if not mayor_data:
-        return None
-    return min(mayor['start_date'] for mayor in mayor_data)
 
 
 def match_mayor_perks(timestamp_str, mayor_data):

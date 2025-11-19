@@ -9,7 +9,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 import lightgbm as lgb
 from data_utils import load_or_fetch_item_data, delete_all_cache
-from mayor_utils import get_mayor_perks, match_mayor_perks, get_mayor_start_date
+from mayor_utils import get_mayor_perks, match_mayor_perks
 import requests
 import gc
 import re
@@ -106,7 +106,6 @@ def prepare_dataframe_from_raw(data, mayor_data=None, has_mayor_system=True):
             'max_sell': fget('maxSell'),
             'min_buy': fget('minBuy'),
             'min_sell': fget('minSell'),
-            'has_mayor_system': 1.0 if has_mayor_system else 0.0  # Flag for pre/post mayor
         }
         mayor_feats=[]
         if mayor_data is not None:
@@ -189,13 +188,100 @@ def clean_infinite_values(X):
     return X
 
 
+def focal_loss_objective(y_true, y_pred, alpha=0.25, gamma=2.0):
+    """Focal loss for LightGBM.
+    
+    Args:
+        y_true: Ground truth labels
+        y_pred: Raw predictions (logits)
+        alpha: Weighting factor for positive class (0.25 = more weight on negatives)
+        gamma: Focusing parameter (2.0 = strongly down-weight easy examples)
+    
+    Returns:
+        grad: Gradient
+        hess: Hessian
+    """
+    # Convert logits to probabilities
+    p = 1.0 / (1.0 + np.exp(-y_pred))
+    
+    # Calculate focal loss components
+    # For y=1: loss = -alpha * (1-p)^gamma * log(p)
+    # For y=0: loss = -(1-alpha) * p^gamma * log(1-p)
+    
+    # Gradient calculation
+    grad = np.where(
+        y_true == 1,
+        alpha * (p - 1) * (gamma * (1 - p) ** (gamma - 1) * np.log(np.maximum(p, 1e-15)) + (1 - p) ** gamma / np.maximum(p, 1e-15)),
+        -(1 - alpha) * p * (gamma * p ** (gamma - 1) * np.log(np.maximum(1 - p, 1e-15)) + p ** gamma / np.maximum(1 - p, 1e-15))
+    )
+    
+    # Hessian (approximate second derivative)
+    hess = np.where(
+        y_true == 1,
+        alpha * p * (1 - p) * gamma * (1 - p) ** (gamma - 1),
+        (1 - alpha) * p * (1 - p) * gamma * p ** (gamma - 1)
+    )
+    
+    return grad, hess
+
+
+def focal_loss_eval(y_pred, data, alpha=0.25, gamma=2.0):
+    """Focal loss evaluation metric for LightGBM.
+    
+    Args:
+        y_pred: Predicted values (probabilities)
+        data: LightGBM Dataset containing the labels
+    """
+    y_true = data.get_label()
+    p = 1.0 / (1.0 + np.exp(-y_pred))
+    
+    loss = np.where(
+        y_true == 1,
+        -alpha * (1 - p) ** gamma * np.log(np.maximum(p, 1e-15)),
+        -(1 - alpha) * p ** gamma * np.log(np.maximum(1 - p, 1e-15))
+    )
+    
+    return 'focal_loss', np.mean(loss), False
+
+
+def optimize_threshold(y_true, y_pred_proba):
+    """Find optimal decision threshold to maximize F1 score.
+    
+    Args:
+        y_true: True labels
+        y_pred_proba: Predicted probabilities
+    
+    Returns:
+        best_threshold: Optimal threshold
+        best_f1: Best F1 score achieved
+    """
+    thresholds = np.arange(0.1, 0.9, 0.05)
+    best_f1 = 0
+    best_threshold = 0.5
+    
+    for threshold in thresholds:
+        y_pred = (y_pred_proba >= threshold).astype(int)
+        
+        tp = ((y_pred == 1) & (y_true == 1)).sum()
+        fp = ((y_pred == 1) & (y_true == 0)).sum()
+        fn = ((y_pred == 0) & (y_true == 1)).sum()
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+    
+    return best_threshold, best_f1
+
+
 def train_three_model_system(item_ids, horizon_bars=1, threshold=0.002, update_mode=False):
     """
     Train THREE separate models (buy, sell, spread) with two-phase temporal training.
     Processes one item at a time to minimize RAM usage.
     
-    Phase 1: Train on data BEFORE mayor data (no mayor features)
-    Phase 2: Train on data AFTER mayor data (with mayor features)
     
     Models:
     - buy_model: Predicts buy price direction
@@ -215,209 +301,144 @@ def train_three_model_system(item_ids, horizon_bars=1, threshold=0.002, update_m
     print("\n" + "="*70)
     print("THREE-MODEL SYSTEM: SEQUENTIAL TWO-PHASE TEMPORAL TRAINING")
     print("Training: BUY model | SELL model | SPREAD model")
-    print("Phase 1: Pre-Mayor Data (no mayor features)")
-    print("Phase 2: Post-Mayor Data (with mayor features)")
     print("Processing one item at a time to minimize RAM usage")
     print("="*70 + "\n")
     
     # Get mayor data to determine split point
     mayor_data = get_mayor_perks()
-    mayor_start_date = get_mayor_start_date(mayor_data)
-    
-    if mayor_start_date is None:
-        print("ERROR: No mayor data found. Cannot proceed with two-phase training.")
-        print("Mayor data is required to split pre/post mayor periods.")
-        return None, None, None, None
-    
-    print(f"Mayor data starts from: {mayor_start_date.strftime('%Y-%m-%d')}")
-    print(f"Splitting data at this timestamp...\n")
     
     item_encoder = LabelEncoder()
     item_encoder.fit(item_ids)
     
     # Initialize THREE models (buy, sell, spread)
     models = {
-        'buy': {'phase1': None, 'phase2': None, 'phase1_count': 0, 'phase2_count': 0},
-        'sell': {'phase1': None, 'phase2': None, 'phase1_count': 0, 'phase2_count': 0},
-        'spread': {'phase1': None, 'phase2': None, 'phase1_count': 0, 'phase2_count': 0}
+        'buy': {'full': None, 'full_count': 0},
+        'sell': {'full': None, 'full_count': 0},
+        'spread': {'full': None, 'full_count': 0}
+    }
+    
+    # Track validation metrics and optimal thresholds
+    validation_metrics = {
+        'buy': {'full': []},
+        'sell': {'full': []},
+        'spread': {'full': []}
+    }
+    
+    optimal_thresholds = {
+        'buy': {'full': []},
+        'sell': {'full': []},
+        'spread': {'full': []}
     }
     
     global_scaler = StandardScaler()  # Shared scaler for all models
     feature_columns = None  # Shared feature columns
     
-    # ========== SEQUENTIAL PROCESSING ==========
     print("\n" + "="*70)
-    print("PHASE 1: Processing Pre-Mayor Data (sequential)")
+    print("Processing Data (sequential)")
     print("="*70 + "\n")
     
     for idx, item_id in enumerate(item_ids):
         print(f"\n[{idx+1}/{len(item_ids)}] Processing {item_id}...")
         
         data = load_or_fetch_item_data(item_id, update_with_new_data=update_mode)
-        if data is None:
-            print(f"  ✗ No data found")
-            continue
+
+        df_base = prepare_dataframe_from_raw(data, mayor_data, has_mayor_system=True)
         
-        # Separate data by mayor availability
-        pre_mayor_data = []
-        post_mayor_data = []
-        
-        for entry in data:
-            if not isinstance(entry, dict) or 'timestamp' not in entry:
-                continue
-            try:
-                ts_str = entry['timestamp']
-                ts_dt = parse_timestamp(ts_str)
+        if not df_base.empty and len(df_base) >= 20:
+            # Train all 3 models on same data
+            for model_type in ['buy', 'sell', 'spread']:
+                df = df_base.copy()
                 
-                if ts_dt < mayor_start_date:
-                    pre_mayor_data.append(entry)
+                # Label based on model type
+                if model_type == 'spread':
+                    df = label_spread_direction(df, horizon_bars, threshold)
+                    target_col = 'target_spread'
                 else:
-                    post_mayor_data.append(entry)
-            except:
-                continue
-        
-        # ===== PHASE 1: Train on pre-mayor data =====
-        if pre_mayor_data:
-            # Pass mayor_data for structure, set has_mayor_system=False so model knows it's pre-mayor
-            df1_base = prepare_dataframe_from_raw(pre_mayor_data, mayor_data=mayor_data, has_mayor_system=False)
-            
-            if not df1_base.empty and len(df1_base) >= 20:
-                # Train all 3 models on same data
-                for model_type in ['buy', 'sell', 'spread']:
-                    df1 = df1_base.copy()
-                    
-                    # Label based on model type
-                    if model_type == 'spread':
-                        df1 = label_spread_direction(df1, horizon_bars, threshold)
-                        target_col = 'target_spread'
-                    else:
-                        df1 = label_direction(df1, horizon_bars, threshold, price_type=model_type)
-                        target_col = f'target_{model_type}'
-                    
-                    df1.dropna(inplace=True)
-                    
-                    if len(df1) >= 20:
-                        df1['item_id_int'] = item_encoder.transform([item_id]*len(df1))
-                        
-                        # Determine feature columns (exclude all future_ and target columns)
-                        exclude_cols = set([c for c in df1.columns if c.startswith('future_') or c.startswith('target_')]) | {'timestamp'}
-                        curr_features = [c for c in df1.columns if c not in exclude_cols]
-                        
-                        if feature_columns is None:
-                            feature_columns = curr_features
-                        else:
-                            curr_features = feature_columns
-                        
-                        X1 = df1[curr_features].values
-                        y1 = df1[target_col].values
-                        X1 = clean_infinite_values(X1)
-                        
-                        # Scale data (shared scaler)
-                        if models['buy']['phase1_count'] == 0 and model_type == 'buy':
-                            X1_scaled = global_scaler.fit_transform(X1)
-                        else:
-                            global_scaler.partial_fit(X1)
-                            X1_scaled = global_scaler.transform(X1)
-                        
-                        # Create dataset
-                        train_data1 = lgb.Dataset(X1_scaled, label=y1)
-                        
-                        # Train model (continue from previous or start new)
-                        models[model_type]['phase1'] = lgb.train(
-                            params={
-                                'objective': 'binary',
-                                'metric': 'auc',
-                                'verbosity': -1,
-                                'learning_rate': 0.05,
-                                'num_leaves': 31,
-                                'feature_fraction': 0.8
-                            },
-                            train_set=train_data1,
-                            num_boost_round=50,  # Fewer rounds per model per item
-                            init_model=models[model_type]['phase1']  # Continue from previous
-                        )
-                        
-                        models[model_type]['phase1_count'] += 1
-                        
-                        del X1, y1, X1_scaled, train_data1, df1
+                    df = label_direction(df, horizon_bars, threshold, price_type=model_type)
+                    target_col = f'target_{model_type}'
                 
-                print(f"  ✓ Phase 1: Trained BUY, SELL, SPREAD models on {len(df1_base)} samples")
-            
-            del df1_base, pre_mayor_data
-        
-        # ===== PHASE 2: Train on post-mayor data =====
-        if post_mayor_data:
-            # Set has_mayor_system=True so model knows mayor features are real
-            df2_base = prepare_dataframe_from_raw(post_mayor_data, mayor_data, has_mayor_system=True)
-            
-            if not df2_base.empty and len(df2_base) >= 20:
-                # Train all 3 models on same data
-                for model_type in ['buy', 'sell', 'spread']:
-                    df2 = df2_base.copy()
-                    
-                    # Label based on model type
-                    if model_type == 'spread':
-                        df2 = label_spread_direction(df2, horizon_bars, threshold)
-                        target_col = 'target_spread'
-                    else:
-                        df2 = label_direction(df2, horizon_bars, threshold, price_type=model_type)
-                        target_col = f'target_{model_type}'
-                    
-                    df2.dropna(inplace=True)
-                    
-                    if len(df2) >= 20:
-                        df2['item_id_int'] = item_encoder.transform([item_id]*len(df2))
-                        
-                        # Determine feature columns (exclude all future_ and target columns)
-                        exclude_cols = set([c for c in df2.columns if c.startswith('future_') or c.startswith('target_')]) | {'timestamp'}
-                        curr_features = [c for c in df2.columns if c not in exclude_cols]
-                        
-                        if feature_columns is None:
-                            feature_columns = curr_features
-                        else:
-                            curr_features = feature_columns
-                        
-                        X2 = df2[curr_features].values
-                        y2 = df2[target_col].values
-                        X2 = clean_infinite_values(X2)
-                        
-                        # Scale data (continue with same scaler from Phase 1)
-                        global_scaler.partial_fit(X2)
-                        X2_scaled = global_scaler.transform(X2)
-                        
-                        # Initialize from Phase 1 on first Phase 2 item, then continue
-                        if models[model_type]['phase2_count'] == 0:
-                            init_phase2 = models[model_type]['phase1']  # Continue from Phase 1
-                        else:
-                            init_phase2 = models[model_type]['phase2']  # Continue from previous Phase 2
-                        
-                        # Create dataset
-                        train_data2 = lgb.Dataset(X2_scaled, label=y2)
-                        
-                        # Train model (continue from previous or Phase 1)
-                        models[model_type]['phase2'] = lgb.train(
-                            params={
-                                'objective': 'binary',
-                                'metric': 'auc',
-                                'verbosity': -1,
-                                'learning_rate': 0.05,
-                                'num_leaves': 31,
-                                'feature_fraction': 0.8
-                            },
-                            train_set=train_data2,
-                            num_boost_round=50,  # Fewer rounds per model per item
-                            init_model=init_phase2  # Continue from previous
-                        )
-                        
-                        models[model_type]['phase2_count'] += 1
-                        
-                        del X2, y2, X2_scaled, train_data2, df2
+                df.dropna(inplace=True)
                 
-                print(f"  ✓ Phase 2: Trained BUY, SELL, SPREAD models on {len(df2_base)} samples")
+                if len(df) >= 20:
+                    df['item_id_int'] = item_encoder.transform([item_id]*len(df))
+                    
+                    # Determine feature columns (exclude all future_ and target columns)
+                    exclude_cols = set([c for c in df.columns if c.startswith('future_') or c.startswith('target_')]) | {'timestamp'}
+                    curr_features = [c for c in df.columns if c not in exclude_cols]
+                    
+                    if feature_columns is None:
+                        feature_columns = curr_features
+                    else:
+                        curr_features = feature_columns
+                    
+                    X2 = df[curr_features].values
+                    y2 = df[target_col].values
+                    X2 = clean_infinite_values(X2)
+                    
+                    # 80/20 temporal split 
+                    split_idx = int(len(X2) * 0.80)
+                    X2_train, X2_val = X2[:split_idx], X2[split_idx:]
+                    y2_train, y2_val = y2[:split_idx], y2[split_idx:]
+                    
+                    # Scale data 
+                    global_scaler.partial_fit(X2_train)
+                    X2_train_scaled = global_scaler.transform(X2_train)
+                    X2_val_scaled = global_scaler.transform(X2_val)
+                    
+                    
+                    # Create datasets
+                    train_data = lgb.Dataset(X2_train_scaled, label=y2_train)
+                    val_data2 = lgb.Dataset(X2_val_scaled, label=y2_val, reference=train_data)
+                    
+                    # Train model with regularization for better generalization
+                    models[model_type]['full'] = lgb.train(
+                        params={
+                            'objective': 'binary',
+                            'metric': 'binary_logloss',
+                            'verbosity': -1,
+                            'learning_rate': 0.25,
+                            'num_leaves': 63,  # Reduced from 31 to prevent overfitting
+                            'max_depth': 31,  # Limit tree depth
+                            'feature_fraction': 0.95, #was 0.8
+                            'lambda_l1': 0.1,  # L1 regularization
+                            'lambda_l2': 0.1,  # L2 regularization
+                            'min_data_in_leaf': 50,  # Prevent overfitting to small groups
+                            'bagging_fraction': 0.8, 
+                            'bagging_freq': 5  # Do bagging every 5 iterations
+                        },
+                        train_set=train_data,
+                        valid_sets=[val_data2],
+                        num_boost_round=50,
+                    )
+                    
+                    # Optimize threshold on validation set
+                    y2_val_pred_proba = models[model_type]['full'].predict(X2_val_scaled)
+                    best_threshold, best_f1 = optimize_threshold(y2_val, y2_val_pred_proba)
+                    
+                    optimal_thresholds[model_type]['full'].append(best_threshold)
+                    
+                    # Calculate validation metrics with optimized threshold
+                    y2_val_pred = (y2_val_pred_proba >= best_threshold).astype(int)
+                    val_acc = (y2_val_pred == y2_val).mean()
+                    val_precision = ((y2_val_pred == 1) & (y2_val == 1)).sum() / max((y2_val_pred == 1).sum(), 1)
+                    val_recall = ((y2_val_pred == 1) & (y2_val == 1)).sum() / max((y2_val == 1).sum(), 1)
+                    
+                    validation_metrics[model_type]['full'].append({
+                        'item': item_id,
+                        'accuracy': val_acc,
+                        'precision': val_precision,
+                        'recall': val_recall,
+                        'f1': best_f1,
+                        'threshold': best_threshold,
+                        'samples': len(y2_val)
+                    })
+                    
+                    models[model_type]['full_count'] += 1
+                    
+                    del X2, y2, X2_train, X2_val, y2_train, y2_val, X2_train_scaled, X2_val_scaled, train_data, val_data2, df
             
-            del df2_base, post_mayor_data
-        
-        # Aggressive cleanup after each item
+            del df_base
+            
         del data
         gc.collect()
     
@@ -425,15 +446,15 @@ def train_three_model_system(item_ids, horizon_bars=1, threshold=0.002, update_m
     print("\n" + "="*70)
     print("THREE-MODEL SEQUENTIAL TRAINING COMPLETE")
     print("="*70)
-    print(f"\nBUY model - Phase 1: {models['buy']['phase1_count']} items, Phase 2: {models['buy']['phase2_count']} items")
-    print(f"SELL model - Phase 1: {models['sell']['phase1_count']} items, Phase 2: {models['sell']['phase2_count']} items")
-    print(f"SPREAD model - Phase 1: {models['spread']['phase1_count']} items, Phase 2: {models['spread']['phase2_count']} items")
+    print(f"Phase 2: {models['buy']['full_count']} items")
+    print(f" Phase 2: {models['sell']['full_count']} items")
+    print(f"Phase 2: {models['spread']['full_count']} items")
     
     # ========== Save All 3 Models ==========
     final_models = {}
     for model_type in ['buy', 'sell', 'spread']:
         # Use Phase 2 model if available, otherwise Phase 1
-        final_models[model_type] = models[model_type]['phase2'] if models[model_type]['phase2'] else models[model_type]['phase1']
+        final_models[model_type] = models[model_type]['full'] 
         
         if final_models[model_type] is None:
             print(f"\nWARNING: No {model_type} model trained. Insufficient data.")
@@ -450,23 +471,46 @@ def train_three_model_system(item_ids, horizon_bars=1, threshold=0.002, update_m
     joblib.dump(feature_columns, 'global_feature_columns.pkl')
     joblib.dump(item_encoder, 'item_encoder.pkl')
     
-    # Save training metrics
+    avg_metrics = {}
+    avg_thresholds = {}
+    
+    for model_type in ['buy', 'sell', 'spread']:
+        for phase in ['full']:
+            if validation_metrics[model_type][phase]:
+                metrics_list = validation_metrics[model_type][phase]
+                avg_metrics[f'{model_type}_{phase}'] = {
+                    'accuracy': np.mean([m['accuracy'] for m in metrics_list]),
+                    'precision': np.mean([m['precision'] for m in metrics_list]),
+                    'recall': np.mean([m['recall'] for m in metrics_list]),
+                    'f1': np.mean([m['f1'] for m in metrics_list]),
+                    'total_samples': sum([m['samples'] for m in metrics_list])
+                }
+                avg_thresholds[f'{model_type}_{phase}'] = np.mean(optimal_thresholds[model_type][phase])
+    
+    # Save training metrics with thresholds
     sequential_metrics = {
-        'training_mode': 'three_model_system',
-        'mayor_start_date': mayor_start_date.strftime('%Y-%m-%d'),
+        'training_mode': 'three_model_system_regularized',
         'buy_model': {
-            'phase1_items': models['buy']['phase1_count'],
-            'phase2_items': models['buy']['phase2_count']
+            'full_items': models['buy']['full_count'],
+            'full_val_accuracy': avg_metrics.get('buy_full', {}).get('accuracy', 0),
+            'full_val_f1': avg_metrics.get('buy_full', {}).get('f1', 0),
+            'full_threshold': avg_thresholds.get('buy_full', 0.5)
         },
         'sell_model': {
-            'phase1_items': models['sell']['phase1_count'],
-            'phase2_items': models['sell']['phase2_count']
+            'full_items': models['sell']['full_count'],
+            'full_val_accuracy': avg_metrics.get('sell_full', {}).get('accuracy', 0),
+            'full_val_f1': avg_metrics.get('sell_full', {}).get('f1', 0),
+            'full_threshold': avg_thresholds.get('sell_full', 0.5)
         },
         'spread_model': {
-            'phase1_items': models['spread']['phase1_count'],
-            'phase2_items': models['spread']['phase2_count']
+            'full_items': models['spread']['full_count'],
+            'full_val_accuracy': avg_metrics.get('spread_full', {}).get('accuracy', 0),
+            'full_val_f1': avg_metrics.get('spread_full', {}).get('f1', 0),
+            'full_threshold': avg_thresholds.get('spread_full', 0.5)
         },
-        'total_items': len(item_ids)
+        'total_items': len(item_ids),
+        'validation_metrics': avg_metrics,
+        'optimal_thresholds': avg_thresholds
     }
     
     with open('model_metrics.json', 'w') as f:
@@ -475,6 +519,15 @@ def train_three_model_system(item_ids, horizon_bars=1, threshold=0.002, update_m
     print("\n" + "="*70)
     print("Three-Model System Training Complete!")
     print("="*70)
+    print("\n--- VALIDATION METRICS (with Focal Loss + Optimized Thresholds) ---")
+    for model_type in ['buy', 'sell', 'spread']:
+        print(f"\n{model_type.upper()} Model:")
+        metrics = avg_metrics.get(f'{model_type}_full', {})
+        thresh = avg_thresholds.get(f'{model_type}_full', 0.5)
+        
+        print(f"  Phase 2: Acc={metrics.get('accuracy', 0)*100:.2f}%, F1={metrics.get('f1', 0)*100:.2f}%, Threshold={thresh:.2f}")
+    
+    print("\n" + "="*70)
     print("\nModel artifacts saved:")
     print("  - buy_lgbm_model.pkl")
     print("  - sell_lgbm_model.pkl")
@@ -776,35 +829,6 @@ def predict_item_with_data(global_model, scaler, feature_columns, item_encoder, 
     
     return result
 
-# ------------------- Example Usage -------------------
-
-if __name__ == '__main__':
-    import sys
-    
-    print("\n" + "="*70)
-    print("TRAINING THREE-MODEL SYSTEM ON SAMPLE DATA")
-    print("="*70)
-    
-    # Fetch all item IDs
-    url = "https://sky.coflnet.com/api/items/bazaar/tags"
-    item_ids = requests.get(url).json()
-    
-    # Train on first 3 items that have data
-    print(f"\nTraining on first 3 items from {len(item_ids)} available items...")
-    models_dict, scaler, feature_columns, item_encoder = train_three_model_system(item_ids[:3])
-    
-    if models_dict is None:
-        print("\nERROR: Training failed. Check data availability.")
-        sys.exit(1)
-    
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE! Models saved successfully.")
-    print("="*70)
-    print("\nYou can now use these models for predictions:")
-    print("  - buy_lgbm_model.pkl")
-    print("  - sell_lgbm_model.pkl")
-    print("  - spread_lgbm_model.pkl")
-    print("\nNext: Update Flask API to load and use all 3 models for predictions.")
 
 
 # ------------------- Investment Analysis Functions -------------------
@@ -1004,3 +1028,32 @@ def analyze_crash_watch(predictions_list, top_n=10):
 
 
 
+# ------------------- Example Usage -------------------
+
+if __name__ == '__main__':
+    import sys
+    number=3
+    print("\n" + "="*70)
+    print(f"TRAINING THREE-MODEL SYSTEM ON {number} ITEMS")
+    print("="*70)
+    
+    # Fetch all item IDs
+    url = "https://sky.coflnet.com/api/items/bazaar/tags"
+    item_ids = requests.get(url).json()
+    
+    # Train on first 100 items for better generalization
+    print(f"\nTraining on first {number} items from {len(item_ids)} available items...")
+    print("This will take longer but improve accuracy on unseen data.\n")
+    models_dict, scaler, feature_columns, item_encoder = train_three_model_system(item_ids[:number])
+    
+    if models_dict is None:
+        print("\nERROR: Training failed. Check data availability.")
+        sys.exit(1)
+    
+    print("\n" + "="*70)
+    print("TRAINING COMPLETE! Models saved successfully.")
+    print("="*70)
+    print("\nYou can now use these models for predictions:")
+    print("  - buy_lgbm_model.pkl")
+    print("  - sell_lgbm_model.pkl")
+    print("  - spread_lgbm_model.pkl")
