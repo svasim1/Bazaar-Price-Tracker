@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-"""
-Load proxies with proper format conversion.
-Handles format: IP:PORT:USERNAME:PASSWORD
-"""
-
 from data_utils import configure_proxy_pool
 
 def parse_proxy_line(line):
