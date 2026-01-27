@@ -8,14 +8,24 @@ import requests
 import warnings
 from sklearn.preprocessing import StandardScaler
 from matplotlib import pyplot as plt
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
 from data_utils import load_or_fetch_item_data, parse_timestamp
 from mayor_utils import get_mayor_perks, match_mayor_perks
-import statsmodels.api as sm
-import asyncio
-import seaborn as sns
+from datetime import datetime, timedelta
+import os
 warnings.filterwarnings("ignore")
 
+
+
+def clean_dump(obj, path):
+    tmp = path + ".tmp"
+    joblib.dump(obj, tmp)
+
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())
+
+    os.replace(tmp, path)
 
 def tukey_clip(y, k=3):
     q1 = np.percentile(y, 25)
@@ -113,29 +123,6 @@ def prepare_dataframe_from_raw(data, mayor_data=None):
 # =========================================================
 
 def build_entry_targets(df, horizon_minutes=1440, tax=0.0125):
-    """
-    Builds risk-aware, temporally-informed regression labels and features
-    for trading ML models.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must include 'timestamp', 'buy_price', 'sell_price'.
-    horizon_minutes : int
-        Lookahead horizon in minutes.
-    tax : float
-        Bazaar tax rate (e.g., 0.0125).
-
-    Returns
-    -------
-    df : pd.DataFrame
-        Adds the following columns:
-            - 'future_max_return' : risk-aware regression target
-            - 'first_event_good' : 1 if max occurs before min
-            - 'time_to_max', 'time_to_min' : seconds until max/min occurs
-            - 'profitable_after_tax' : 1 if future_max_return > tax
-    """
-    
     df = df.copy().sort_values('timestamp').reset_index(drop=True)
     
     timestamps = pd.to_datetime(df['timestamp']).astype('int64') // 10**9
@@ -207,15 +194,22 @@ def clean_infinite_values(X):
     X = np.nan_to_num(X, nan=0.0, posinf=1e8, neginf=-1e8)
     return np.clip(X, -1e8, 1e8)
 
+# =========================================================
+# Quantile Loss
+# =========================================================
+
+def quantile_loss(y_true, y_pred, alpha):
+    diff = y_true - y_pred
+    return np.mean(np.maximum(alpha * diff, (alpha - 1) * diff))
 
 # =========================================================
 # Optuna Objective (Entry Regression)
 # =========================================================
 
-def entry_objective(trial, X, y):
+def entry_objective(trial, X, y, alpha=1e-4):
     params = {
-        "objective": "regression",
-        "metric": "rmse",
+        "objective": "quantile",
+        "alpha": alpha,
         "learning_rate": trial.suggest_float("lr", 0.01, 0.15, log=True),
         "num_leaves": trial.suggest_int("num_leaves", 16, 64),
         "feature_fraction": 0.8,
@@ -228,8 +222,9 @@ def entry_objective(trial, X, y):
     model = lgb.train(params, dtrain, num_boost_round=300)
 
     preds = model.predict(X)
-    rmse = np.sqrt(np.mean((preds - y)**2))
-    return -rmse
+
+    loss = quantile_loss(y, preds, alpha)
+    return -loss
 
 
 # =========================================================
@@ -257,12 +252,9 @@ def percent_error_stats(y_true, y_pred, eps=1e-9):
 # =========================================================
 
 def train_model_system(item_id):
-    resp = requests.get(f"https://sky.coflnet.com/api/bazaar/{item_id}/history/week")
-    new_data = resp.json()
     mayor_data = get_mayor_perks()
     data = load_or_fetch_item_data(item_id)
     
-    calib_df = prepare_dataframe_from_raw(new_data, mayor_data)
     df = prepare_dataframe_from_raw(data, mayor_data)
     if len(df) < 50:
         print(f"{item_id}: not enough data")
@@ -275,12 +267,14 @@ def train_model_system(item_id):
 
     X = clean_infinite_values(df[feature_cols].values)
     y = df['future_max_return'].values
-    X_calib = clean_infinite_values(calib_df[feature_cols].values)
-    y_calib = calib_df['future_max_return'].values
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    X_calib_scaled = scaler.transform(X_calib)
+
+    y = tukey_clip(y, k=3)
+
+
+
 
     study = optuna.create_study(direction="maximize")
     study.optimize(lambda t: entry_objective(t, X_scaled, y), n_trials=30)
@@ -293,20 +287,19 @@ def train_model_system(item_id):
     })
 
     model = lgb.train(params, lgb.Dataset(X_scaled, label=y), num_boost_round=400)
-    y_pred_calib = model.predict(X_calib_scaled)
-    pct_err = np.abs((y_pred_calib - y_calib) / (np.abs(y_calib) + 1e-9))
-    err_q95 = np.percentile(pct_err, 95)
-    err_q99 = np.percentile(pct_err, 99)
-    pct_error_data = {
-        "item_id": item_id,
-        "95th_percentile_error": err_q95,
-        "99th_percentile_error": err_q99
-    }
-    base = f"/Users/samuelbraga/Model Files/{item_id}"
-    joblib.dump(pct_error_data, base + "_entry_pct_error.pkl")
-    joblib.dump(model, base + "_entry_model.pkl")
-    joblib.dump(scaler, base + "_entry_scaler.pkl")
-    joblib.dump(feature_cols, base + "_entry_features.pkl")
+    model_dir = os.path.expanduser("~/Model_Files") 
+    os.makedirs(model_dir, exist_ok=True)
+    
+    base = os.path.join(model_dir, str(item_id))
+    
+
+    try:
+        clean_dump(model, base + "_entry_model.pkl")
+        clean_dump(scaler, base + "_entry_scaler.pkl")
+        clean_dump(feature_cols, base + "_entry_features.pkl")
+        print(f"✓ Successfully saved models for {item_id}")
+    except Exception as e:
+        print(f"✗ Error saving files for {item_id}: {e}")
 
 # =========================================================
 # Test Train Setup for Model Accuracy Metrics
@@ -408,55 +401,97 @@ def test_train_model_system(item_id):
     print("Safe sign accuracy (true positive returns):", safe_sign_acc)
 
 # =========================================================
-# Prediction
+# FUTURE PREDICTIONS (MULTI-TIMESTAMP)
 # =========================================================
 
-def predict_entries(model, scaler, feature_cols, item_id, mayor_data=None):
-    url = f"https://sky.coflnet.com/api/bazaar/{item_id}/history/day"
-    raw = requests.get(url).json()
 
+
+def predict_entries(model, scaler, feature_cols, item_id, mayor_data=None, horizon_hours=24, step_minutes=5):
+    now = datetime.now()
+    start = now - timedelta(hours=horizon_hours)
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%S.000").replace(":", "%3A")
+    end_str = now.strftime("%Y-%m-%dT%H:%M:%S.000").replace(":", "%3A")
+    base_url = "https://sky.coflnet.com/api/bazaar"
+    url = f"{base_url}/{item_id}/history?start={start_str}&end={end_str}"
+    raw = requests.get(url).json()
     df = prepare_dataframe_from_raw(raw, mayor_data)
     if df.empty:
-        return df
+        return []
 
-    for c in feature_cols:
-        if c not in df.columns:
-            df[c] = 0.0
+    last_row = df.iloc[-1:].copy()
 
-    X = clean_infinite_values(df[feature_cols].values)
-    X_scaled = scaler.transform(X)
+    future_times = pd.date_range(start=now, periods=int(horizon_hours*60/step_minutes), freq=f"{step_minutes}T")
 
-    df['entry_score'] = model.predict(X_scaled)
-    return df[['timestamp', 'sell_price', 'entry_score']]
+    preds = []
+    for ts in future_times:
+        row = last_row.copy()
+        row['timestamp'] = ts
+
+        if mayor_data is not None:
+            perks = match_mayor_perks(ts, mayor_data)
+            for i, v in enumerate(perks):
+                row[f'mayor_{i}'] = v
+
+        for c in feature_cols:
+            if c not in row.columns:
+                row[c] = 0.0
+        row[feature_cols] = row[feature_cols].fillna(0.0)
+
+        X = clean_infinite_values(row[feature_cols].values)
+        X_scaled = scaler.transform(X)
+        y_pred = model.predict(X_scaled)[0]
+        row['entry_score'] = y_pred
+        row['timestamp'] = ts.isoformat()
+        preds.append(row[['timestamp', 'buy_price', 'sell_price', 'entry_score']].to_dict(orient='records')[0])
+
+
+    return preds
 
 
 # =========================================================
-# ENTRY ANALYSIS (TIME-AWARE RANKING)
+# ANALYZE TOP PREDICTIONS
 # =========================================================
 
-def analyze_entries(df, min_score=0.05, min_delta_minutes=30, top_k=5):
-    df = df[df['entry_score'] >= min_score].copy()
-    df = df.sort_values('entry_score', ascending=False)
+def analyze_entries(pred_list, top_k=5):
+    if not pred_list:
+        return []
 
-    selected = []
-    last_ts = None
+    now = datetime.now()
+    enriched = []
 
-    for _, row in df.iterrows():
-        ts = row['timestamp']
-        if last_ts is None:
-            selected.append(row)
-            last_ts = ts
+    for e in pred_list:
+        try:
+            score = float(e.get('entry_score', 0.0))
+        except Exception:
             continue
 
-        delta = (ts - last_ts).total_seconds() / 60
-        if delta >= min_delta_minutes:
-            selected.append(row)
-            last_ts = ts
+        if score <= 0:
+            continue
 
-        if len(selected) >= top_k:
-            break
+        ts_str = e.get('timestamp')
+        if not ts_str:
+            continue
 
-    return pd.DataFrame(selected)
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except Exception:
+            continue
+
+        delta_minutes = (ts - now).total_seconds() / 60.0
+        if delta_minutes < 0:
+            continue
+
+        enriched_entry = dict(e)
+        enriched_entry['delta_minutes'] = float(delta_minutes)
+        enriched.append(enriched_entry)
+
+
+    enriched.sort(key=lambda x: (x['delta_minutes'], -x['entry_score']))
+
+    return enriched[:top_k]
+
+
+
 
 
 # =========================================================
@@ -464,11 +499,10 @@ def analyze_entries(df, min_score=0.05, min_delta_minutes=30, top_k=5):
 # =========================================================
 
 if __name__ == "__main__":
-    with open("sorted_by_demand_items.json") as f:
+    with open("bazaar_full_items_ids.json") as f:
         items = json.load(f)
-
-    for entry in items[:200]:
-        print(f"Training {entry['item_id']}")
-        test_train_model_system(entry['item_id'])
+    for entry in items:
+        print(f"Training {entry}")
+        train_model_system(entry)
 
 

@@ -16,14 +16,14 @@ from datetime import datetime
 import traceback
 
 from LGBMfulldata import (
-    predict_item, train_model_system, analyze_entries
+    predict_entries, analyze_entries
 )
 from mayor_utils import get_mayor_perks
 
 app = Flask(__name__)
 CORS(app)
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = "/Users/samuelbraga/Model_Files"
 
 # Global artifacts
 models_dict = {}          # {item_id: trained_model}
@@ -53,15 +53,18 @@ def load_model_artifacts():
         feature_columns_dict.clear()
 
         for item_id in item_ids:
-            model_path = os.path.join(SCRIPT_DIR, f'{item_id}_classifier_lgbm_model.pkl')
-            scaler_path = os.path.join(SCRIPT_DIR, f'{item_id}_global_scaler.pkl')
-            features_path = os.path.join(SCRIPT_DIR, f'{item_id}_global_feature_columns.pkl')
+            model_path = os.path.join(SCRIPT_DIR, f'{item_id}_entry_model.pkl')
+            scaler_path = os.path.join(SCRIPT_DIR, f'{item_id}_entry_scaler.pkl')
+            features_path = os.path.join(SCRIPT_DIR, f'{item_id}_entry_features.pkl')
 
             if os.path.exists(model_path):
-                models_dict[item_id] = joblib.load(model_path)
-                scalers_dict[item_id] = joblib.load(scaler_path)
-                feature_columns_dict[item_id] = joblib.load(features_path)
+                models_dict[item_id] = {"model_path": model_path}
+                scalers_dict[item_id] = {"scaler_path": scaler_path}
+                feature_columns_dict[item_id] = {"features_path": features_path}
 
+        # Only mark the model as ready if we actually found at least one
+        # trained item. The previous check against an empty dict view was
+        # always ``True``.
         model_trained = len(models_dict) > 0
         print(f"✅ Loaded entry-based models: {len(models_dict)} items")
         return model_trained
@@ -74,12 +77,14 @@ def load_model_artifacts():
 
 def get_available_items():
     """Return item IDs with downloaded JSON data."""
-    json_dir = "/Users/samuelbraga/Json Files"
+    json_dir = "/Users/samuelbraga/Model_Files"
     items = []
     try:
         if os.path.exists(json_dir):
             for fname in os.listdir(json_dir):
-                item_id = fname.replace("bazaar_history_", "").replace(".pkl.gz", "")
+                if not fname.endswith("_entry_model.pkl"):
+                    continue
+                item_id = fname.replace("_entry_model.pkl", "")
                 items.append(item_id)
         return items
     except Exception as e:
@@ -132,15 +137,15 @@ def background_prediction_loop():
 
             for item_id in items:
                 try:
-                    model = models_dict.get(item_id)
-                    scaler = scalers_dict.get(item_id)
-                    features = feature_columns_dict.get(item_id)
-                    mayor_data = mayor_data_cache.get(item_id) if mayor_data_cache else None
+                    model = joblib.load(models_dict[item_id]["model_path"])
+                    scaler = joblib.load(scalers_dict[item_id]["scaler_path"])
+                    features = joblib.load(feature_columns_dict[item_id]["features_path"])
+                    mayor_data = mayor_data_cache
 
                     if not model or not scaler or not features:
                         continue
 
-                    prediction_df = predict_item(model, None, scaler, features, item_id, mayor_data)
+                    prediction_df = predict_entries(model, scaler, features, item_id, mayor_data)
                     ranked_entries = analyze_entries(prediction_df)
 
                     with prediction_lock:
@@ -212,15 +217,15 @@ def get_items():
 @app.route('/predict/<item_id>')
 def predict_single(item_id):
     try:
-        model = models_dict.get(item_id)
-        scaler = scalers_dict.get(item_id)
-        features = feature_columns_dict.get(item_id)
-        mayor_data = mayor_data_cache.get(item_id) if mayor_data_cache else None
+        model = joblib.load(models_dict[item_id]["model_path"])
+        scaler = joblib.load(scalers_dict[item_id]["scaler_path"])
+        features = joblib.load(feature_columns_dict[item_id]["features_path"])
+        mayor_data = mayor_data_cache
 
         if not model or not scaler or not features:
             return jsonify({'error': 'Model not found for this item'}), 404
 
-        df_pred = predict_item(model, None, scaler, features, item_id, mayor_data)
+        df_pred = predict_entries(model, scaler, features, item_id, mayor_data)
         ranked_entries = analyze_entries(df_pred)
 
         return jsonify({
@@ -228,32 +233,74 @@ def predict_single(item_id):
             'timestamp': datetime.now().isoformat(),
             'entries': ranked_entries
         })
-
+    
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/predictions')
 def get_cached():
+    """Return best upcoming positive entry per item for homescreen ranking.
+
+    For each item in ``cached_predictions`` we:
+    - assume ``entries`` has already been processed by ``analyze_entries``
+      to keep only positive, time-annotated signals
+    - take the first entry (closest-in-time positive signal)
+    - build a flat summary row used by the Minecraft GUI homescreen
+
+    Items are ranked primarily by how soon the positive entry occurs
+    (smallest ``delta_minutes`` first), then by ``entry_score``.
+    """
     try:
-        limit = int(request.args.get('limit', 10))
-        min_conf = float(request.args.get('min_confidence', 0.5))
+        limit = int(request.args.get('limit', 100))
+        min_score = float(request.args.get('min_score', 0.0))
 
         with prediction_lock:
             preds = list(cached_predictions.values())
 
-        # Filter and sort by confidence
-        filtered = []
+        ranked_items = []
+        now = datetime.now()
+
         for p in preds:
-            entries = [e for e in p['entries'] if e['confidence'] >= min_conf]
-            if entries:
-                filtered.append({'item_id': p['item_id'], 'entries': entries})
+            item_id = p.get('item_id')
+            entries = p.get('entries') or []
+            if not item_id or not entries:
+                continue
 
-        # Sort each item's entries by delta_time
-        for p in filtered:
-            p['entries'].sort(key=lambda x: x['delta_time'])
+            # Entries from analyze_entries are already positive and sorted by
+            # delta_minutes ascending; take the closest one.
+            best = entries[0]
+            score = float(best.get('entry_score', 0.0))
+            if score <= min_score:
+                continue
 
-        return jsonify({'predictions': filtered[:limit], 'total': len(filtered)})
+            # Ensure we have a usable delta_minutes; if missing, recompute
+            # defensively from the timestamp.
+            delta_minutes = best.get('delta_minutes')
+            if delta_minutes is None:
+                ts_str = best.get('timestamp')
+                if ts_str:
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                        delta_minutes = (ts - now).total_seconds() / 60.0
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+            ranked_items.append({
+                'item_id': item_id,
+                'timestamp': best.get('timestamp'),
+                'buy_price': best.get('buy_price'),
+                'sell_price': best.get('sell_price'),
+                'entry_score': score,
+                'delta_minutes': float(delta_minutes),
+            })
+
+        # Sort by time-to-entry, then by score
+        ranked_items.sort(key=lambda x: (x['delta_minutes'], -x['entry_score']))
+
+        return jsonify({'items': ranked_items[:limit], 'total': len(ranked_items)})
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
