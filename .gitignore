@@ -1,5 +1,20 @@
 # Cache
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Virtual environment
 .venv/
+
+# macOS
+.DS_Store
+
+# Project outputs
+Model_Files/
+predictions_cache.json
+
+# Python packaging
+*.egg-info/
+dist/
+build/
