@@ -1,7 +1,7 @@
 import requests
 import re
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 def get_mayor_perks():
@@ -12,7 +12,7 @@ def get_mayor_perks():
             - start_date: datetime object for when the mayor term started
             - perks: list of 40 binary values (0 or 1) representing active perks
     """
-    current_datetime = datetime.now()
+    current_datetime = datetime.now(timezone.utc)
     url = f"https://sky.coflnet.com/api/mayor?from=2022-05-17T20%3A03%3A10.937Z&to={current_datetime.strftime('%Y-%m-%dT%H%%3A%M%%3A%S.%fZ')}"
     
     response = requests.get(url)

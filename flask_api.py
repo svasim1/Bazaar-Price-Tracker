@@ -12,7 +12,7 @@ import requests
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 
 from LGBMfulldata import (
@@ -151,7 +151,7 @@ def background_prediction_loop():
                     with prediction_lock:
                         cached_predictions[item_id] = {
                             'item_id': item_id,
-                            'timestamp': datetime.now().isoformat(),
+                            'timestamp': datetime.now(timezone.utc).isoformat(),
                             'entries': ranked_entries
                         }
 
@@ -200,7 +200,7 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'model_trained': model_trained,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat()
     })
 
 
@@ -230,7 +230,7 @@ def predict_single(item_id):
 
         return jsonify({
             'item_id': item_id,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'entries': ranked_entries
         })
     
@@ -259,7 +259,7 @@ def get_cached():
             preds = list(cached_predictions.values())
 
         ranked_items = []
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         for p in preds:
             item_id = p.get('item_id')
@@ -317,7 +317,7 @@ def best_investments():
         return jsonify({
             'investments': investments,
             'total': len(investments),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
