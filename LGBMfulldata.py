@@ -6,13 +6,14 @@ import joblib
 import lightgbm as lgb
 import requests
 import warnings
+from event_utils import add_skyblock_time_features
 from sklearn.preprocessing import StandardScaler
 from matplotlib import pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import r2_score
 from data_utils import load_or_fetch_item_data, parse_timestamp
 from mayor_utils import get_mayor_perks, match_mayor_perks
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 warnings.filterwarnings("ignore")
 
@@ -75,7 +76,6 @@ def build_lagged_features(
 
     return df
 
-
 def prepare_dataframe_from_raw(data, mayor_data=None):
     rows = []
 
@@ -115,6 +115,7 @@ def prepare_dataframe_from_raw(data, mayor_data=None):
     df = df.sort_values('timestamp').reset_index(drop=True)
     df = add_time_features(df)
     df = build_lagged_features(df, price_col='buy_price', vol_col='buy_volume', prefix='buy_')
+    df = add_skyblock_time_features(df, ts_col='timestamp')
     return df
 
 
@@ -407,7 +408,7 @@ def test_train_model_system(item_id):
 
 
 def predict_entries(model, scaler, feature_cols, item_id, mayor_data=None, horizon_hours=24, step_minutes=5):
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     start = now - timedelta(hours=horizon_hours)
     start_str = start.strftime("%Y-%m-%dT%H:%M:%S.000").replace(":", "%3A")
     end_str = now.strftime("%Y-%m-%dT%H:%M:%S.000").replace(":", "%3A")
@@ -456,7 +457,7 @@ def analyze_entries(pred_list, top_k=5):
     if not pred_list:
         return []
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     enriched = []
 
     for e in pred_list:

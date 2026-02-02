@@ -1,7 +1,7 @@
 import requests
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 import gzip
 import pickle
@@ -268,7 +268,7 @@ def fetch_all_data(item, start=None, end=None, interval_seconds=82800, use_binar
         List of data entries from the API
     """
     if end is None:
-        end = datetime.now()
+        end = datetime.now(timezone.utc)
     
     # Use binary search to find oldest data if start not specified
     if start is None and use_binary_search:
@@ -334,7 +334,7 @@ def fetch_all_data_fast(item, start=None, end=None, interval_seconds=82800, use_
         data = fetch_all_data_fast('ENCHANTMENT_ULTIMATE_WISE_5')
     """
     if end is None:
-        end = datetime.now()
+        end = datetime.now(timezone.utc)
     
     # Use binary search to find oldest data if start not specified
     if start is None and use_binary_search:
@@ -458,9 +458,9 @@ def load_or_fetch_item_data(item_id, fetch_if_missing=True, update_with_new_data
             print(f"  → Fetching new data since {latest_timestamp.strftime('%Y-%m-%d')}...")
             # Fetch data from latest timestamp to now (no binary search needed for updates)
             if use_fast_mode:
-                new_data = fetch_all_data_fast(item_id, start=latest_timestamp, end=datetime.now(), use_binary_search=False)
+                new_data = fetch_all_data_fast(item_id, start=latest_timestamp, end=datetime.now(timezone.utc), use_binary_search=False)
             else:
-                new_data = fetch_all_data(item_id, start=latest_timestamp, end=datetime.now(), use_binary_search=False)
+                new_data = fetch_all_data(item_id, start=latest_timestamp, end=datetime.now(timezone.utc), use_binary_search=False)
             
             if new_data:
                 # Append new data
@@ -493,7 +493,7 @@ def fetch_recent_data(item_id, hours=24):
     Returns:
         List of recent data entries from the API
     """
-    end = datetime.now()
+    end = datetime.now(timezone.utc)
     start = end - timedelta(hours=hours)
     
     start_str = start.strftime("%Y-%m-%dT%H:%M:%S.000").replace(":", "%3A")
