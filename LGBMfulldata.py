@@ -13,19 +13,30 @@ from sklearn.metrics import r2_score
 from data_utils import load_or_fetch_item_data, parse_timestamp
 from mayor_utils import get_mayor_perks, match_mayor_perks
 from datetime import datetime, timedelta
+from tqdm import trange
 import os
 warnings.filterwarnings("ignore")
 
 
 
 def clean_dump(obj, path):
+    """Atomic write with fsync for durability"""
     tmp = path + ".tmp"
     joblib.dump(obj, tmp)
-
-    with open(tmp, "rb") as f:
-        os.fsync(f.fileno())
-
-    os.replace(tmp, path)
+    
+    # Force write to disk (Windows-compatible)
+    try:
+        with open(tmp, "r+b") as f:
+            f.flush()
+            os.fsync(f.fileno())
+    except (OSError, IOError):
+        # If fsync fails, continue anyway - file is already written
+        pass
+    
+    # Atomic rename
+    if os.path.exists(path):
+        os.remove(path)
+    os.rename(tmp, path)
 
 def tukey_clip(y, k=3):
     q1 = np.percentile(y, 25)
@@ -124,46 +135,39 @@ def prepare_dataframe_from_raw(data, mayor_data=None):
 
 def build_entry_targets(df, horizon_minutes=1440, tax=0.0125):
     df = df.copy().sort_values('timestamp').reset_index(drop=True)
-    
     timestamps = pd.to_datetime(df['timestamp']).astype('int64') // 10**9
+    timestamps = timestamps.values  # Pure numpy for faster indexing
     horizon_sec = horizon_minutes * 60
     
-    # compute immediate future return
+    # Compute immediate future return
     future_return = (df['buy_price'].values * (1 - tax) - df['sell_price'].values) / (df['sell_price'].values + 1e-9)
-    df['future_return'] = future_return
     
-    # initialize lists to store features
-    future_max_return = []
-    first_event_good = []
-    time_to_max = []
-    time_to_min = []
+    n = len(df)
+    future_max_return = np.zeros(n)
+    first_event_good = np.zeros(n, dtype=int)
+    time_to_max = np.zeros(n)
+    time_to_min = np.zeros(n)
     
-    timestamps_np = timestamps.values if isinstance(timestamps, pd.Series) else timestamps
-    
-    # loop over each row
-    for i in range(len(df)):
-        # select rows within the horizon
-        horizon_mask = (timestamps_np >= timestamps_np[i]) & (timestamps_np - timestamps_np[i] <= horizon_sec)
-        idxs_horizon = np.where(horizon_mask)[0]
-        returns_horizon = future_return[idxs_horizon]
+    # Sliding window: O(n) instead of O(n²)
+    j = 0
+    for i in trange(n, desc="Building targets", leave=False):
+        # Advance right pointer until outside horizon
+        while j < n and timestamps[j] - timestamps[i] <= horizon_sec:
+            j += 1
         
-        if len(returns_horizon) == 0:
-            future_max_return.append(0.0)
-            first_event_good.append(0)
-            time_to_max.append(0)
-            time_to_min.append(0)
+        window = future_return[i:j]
+        if len(window) == 0:
             continue
         
-        # find max/min and their absolute indices
-        t_max_rel = np.argmax(returns_horizon)
-        t_min_rel = np.argmin(returns_horizon)
-        t_max = idxs_horizon[t_max_rel]
-        t_min = idxs_horizon[t_min_rel]
+        t_max_rel = np.argmax(window)
+        t_min_rel = np.argmin(window)
+        t_max = i + t_max_rel
+        t_min = i + t_min_rel
         
-        best_return = returns_horizon[t_max_rel]
-        worst_return = returns_horizon[t_min_rel]
+        best_return = window[t_max_rel]
+        worst_return = window[t_min_rel]
         
-        # risk-aware heuristic
+        # Risk-aware heuristic
         if abs(worst_return) > best_return:
             label = worst_return
         elif t_max < t_min:
@@ -171,18 +175,16 @@ def build_entry_targets(df, horizon_minutes=1440, tax=0.0125):
         else:
             label = worst_return
         
-        future_max_return.append(label)
-        first_event_good.append(int(t_max < t_min))
-        time_to_max.append(timestamps_np[t_max] - timestamps_np[i])
-        time_to_min.append(timestamps_np[t_min] - timestamps_np[i])
+        future_max_return[i] = label
+        first_event_good[i] = int(t_max < t_min)
+        time_to_max[i] = timestamps[t_max] - timestamps[i]
+        time_to_min[i] = timestamps[t_min] - timestamps[i]
     
-    # assign features to DataFrame
     df['future_max_return'] = future_max_return
     df['first_event_good'] = first_event_good
     df['time_to_max'] = time_to_max
     df['time_to_min'] = time_to_min
     df['profitable_after_tax'] = (df['future_max_return'] > tax).astype(int)
-    
     return df
 
 # =========================================================
@@ -268,6 +270,15 @@ def train_model_system(item_id):
     X = clean_infinite_values(df[feature_cols].values)
     y = df['future_max_return'].values
 
+    # Quick label diagnostics
+    try:
+        print(
+            f"{item_id} labels: min={np.min(y):.6f}, med={np.median(y):.6f}, max={np.max(y):.6f}, "
+            f"pos%={(np.mean(y > 0) * 100):.2f}%"
+        )
+    except Exception:
+        pass
+
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
@@ -287,7 +298,7 @@ def train_model_system(item_id):
     })
 
     model = lgb.train(params, lgb.Dataset(X_scaled, label=y), num_boost_round=400)
-    model_dir = os.path.expanduser("~/Model_Files") 
+    model_dir = os.path.join(os.path.dirname(__file__), "Model_Files")
     os.makedirs(model_dir, exist_ok=True)
     
     base = os.path.join(model_dir, str(item_id))
@@ -420,9 +431,10 @@ def predict_entries(model, scaler, feature_cols, item_id, mayor_data=None, horiz
 
     last_row = df.iloc[-1:].copy()
 
-    future_times = pd.date_range(start=now, periods=int(horizon_hours*60/step_minutes), freq=f"{step_minutes}T")
+    future_times = pd.date_range(start=now, periods=int(horizon_hours*60/step_minutes), freq=f"{step_minutes}min")
 
     preds = []
+    scores = []
     for ts in future_times:
         row = last_row.copy()
         row['timestamp'] = ts
@@ -442,7 +454,19 @@ def predict_entries(model, scaler, feature_cols, item_id, mayor_data=None, horiz
         y_pred = model.predict(X_scaled)[0]
         row['entry_score'] = y_pred
         row['timestamp'] = ts.isoformat()
+        scores.append(y_pred)
         preds.append(row[['timestamp', 'buy_price', 'sell_price', 'entry_score']].to_dict(orient='records')[0])
+
+    # Quick prediction diagnostics
+    if scores:
+        try:
+            s = np.array(scores)
+            print(
+                f"{item_id} scores: min={s.min():.6f}, med={np.median(s):.6f}, max={s.max():.6f}, "
+                f"pos%={(np.mean(s > 0) * 100):.2f}%"
+            )
+        except Exception:
+            pass
 
 
     return preds
