@@ -173,15 +173,23 @@ def build_entry_targets(df, horizon_minutes=180, tax=0.0125):
         time_to_min.append(ts[t_min] - ts[i])
     
     df['entry_label'] = expected_return
+
+    """
     df['profit_prob'] = profit_prob
     df['time_to_first_up'] = time_to_first_up
     df['time_to_first_down'] = time_to_first_down
     df['time_to_max'] = time_to_max
     df['time_to_min'] = time_to_min
+    """
 
     return df
 
-
+def build_entry_targets_fast(df, item_id):
+    csv_directory = os.path.expanduser("~/Bazaar_Mod/Bazaar Price Tracker/csv files")
+    df_labels = pd.read_csv(os.path.join(csv_directory, f"{item_id}_debug_data.csv"), parse_dates=['timestamp'])
+    df_labels = df_labels[["timestamp", "entry_label"]]
+    df = df.merge(df_labels, on='timestamp', how='left')
+    return df
 # =========================================================
 # Cleaning
 # =========================================================
@@ -302,7 +310,7 @@ def train_model_system(item_id):
 # =========================================================
 
 
-def test_train_model_system(item_id):
+def test_train_model_system(item_id, lower = 0.001, upper = 0.999):
     mayor_data = get_mayor_perks()
     data = load_or_fetch_item_data(item_id)
 
@@ -311,7 +319,7 @@ def test_train_model_system(item_id):
         print(f"{item_id}: not enough data")
         return
 
-    df = build_entry_targets(df)
+    df = build_entry_targets_fast(df)
     split_idx = int(len(df) * 0.8)  
     train_df = df.iloc[:split_idx]
     val_df = df.iloc[split_idx:]
@@ -324,8 +332,8 @@ def test_train_model_system(item_id):
     X_val = clean_infinite_values(val_df[feature_cols].values)
     y_val = val_df['entry_label'].values
 
-    y_val = clip_extreme_outliers(y_val) 
-    y_train = clip_extreme_outliers(y_train)
+    y_val = clip_extreme_outliers(y_val, lower_pct=lower, upper_pct=upper) 
+    y_train = clip_extreme_outliers(y_train, lower_pct=lower, upper_pct=upper)
 
 
     scaler = StandardScaler()
@@ -553,7 +561,11 @@ if __name__ == "__main__":
     with open(file_path) as f:
         items = json.load(f)
     for entry in items:
-        print(f"Training {entry}")
-        test_datasets(entry)
+        if entry == "BOOSTER_COOKIE":
+            test_train_model_system(entry, lower=0.0001, upper=1.0)
+        elif entry == "CONTROL_SWITCH" or entry == "ELECTRON_TRANSMITTER" or entry == "FTX_3070":
+            test_train_model_system(entry, lower=0.01, upper=0.99)
+        elif entry == "FLAWLESS_SAPPHIRE_GEM":
+            test_train_model_system(entry)
 
 
